@@ -106,6 +106,11 @@ struct Trampoline {
   bool Long = false;
   bool UsesSetPCBack = false;
   unsigned LongBranchSgprBase = 0;
+  // True when LongBranchSgprBase names a pair proven dead at the far-return
+  // site (a reused original numbered pair, or VCC via the Gfx1250MaxSgprs
+  // sentinel). Such a pair is already accounted for and must not be charged
+  // to the owning kernel's SGPR count, and gates adjacent-trampoline merging.
+  bool LongBranchScratchIsSiteProven = false;
   bool HasPoolBranchIsland = false;
   uint64_t PoolBranchIslandOffset = 0;
   bool UsesShortBranchForward = false;
@@ -762,6 +767,20 @@ struct SafeSgprUsageSummary {
   unsigned HighWatermark = 0;
 };
 
+/// Per-function site-dead numbered-SGPR facts, computed once from the immutable
+/// decoded stream before any patch relabels instructions. SafeBefore[i] is the
+/// set of numbered SGPRs defined before any reachable use from instruction i
+/// (i.e. dead at that resume point); ForbiddenResume marks indices interior to
+/// a materialized get-PC/add/set-PC sequence, where resuming is invalid.
+struct SiteDeadSgprFunctionFacts {
+  uint64_t Begin = 0;
+  uint64_t End = 0;
+  size_t GlobalFirst = 0;
+  unsigned NumberedLimit = 0;
+  std::vector<std::array<uint64_t, 2>> SafeBefore;
+  llvm::BitVector ForbiddenResume;
+};
+
 /// Mutable per-run context threaded through all patch passes. Bundles the
 /// input config, decoded instruction stream, raw .text bytes, MC state,
 /// output streams (trampolines / scratch info), and the shared ELF view +
@@ -797,6 +816,11 @@ struct PatchContext {
   std::optional<SafeSgprUsageSummary> WholeObjectSgprUsage;
   llvm::DenseMap<std::pair<uint64_t, uint64_t>, SafeSgprUsageSummary>
       FunctionSgprUsage{0};
+  // Per-function site-dead numbered-SGPR facts, keyed by {funcBegin, funcEnd}
+  // .text-relative range. Populated once by precomputeSiteDeadSgprFacts before
+  // patching so a far-return site can reuse an original pair proven dead there.
+  llvm::DenseMap<std::pair<uint64_t, uint64_t>, SiteDeadSgprFunctionFacts>
+      SiteDeadSgprFacts{0};
 };
 
 /// A block of numbered SGPRs that is not referenced in the function being
@@ -805,6 +829,10 @@ struct PatchContext {
 struct SafeSgprScratchBlock {
   unsigned Base = 0;
   unsigned Count = 0;
+  // True when Base names a pair proven dead at the site (reused original pair
+  // or VCC), rather than a freshly reserved unused block. A site-proven pair
+  // is already counted and is not charged again to the kernel descriptor.
+  bool IsSiteProven = false;
 };
 
 /// Find an aligned block of unused numbered SGPRs for \p TextOffset. Returns

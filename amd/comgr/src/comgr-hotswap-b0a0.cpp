@@ -695,8 +695,24 @@ bool commitSafeSgprScratchBlock(PatchContext &Ctx, uint64_t TextOffset,
   return true;
 }
 
+// Defined below, after evaluateDirectControlFlowTarget (which the site-dead
+// analysis transitively needs); forward-declared here so reserveSafeFarReturn
+// can prefer a numbered pair proven dead at the far-return site.
+static std::optional<unsigned>
+findSiteDeadOriginalPair(PatchContext &Ctx, uint64_t InstOffset,
+                         uint32_t InstSize, ArrayRef<uint8_t> Replacement);
+
 static std::optional<SafeSgprScratchBlock>
-reserveSafeFarReturn(PatchContext &Ctx, uint64_t InstOffset) {
+reserveSafeFarReturn(PatchContext &Ctx, uint64_t InstOffset, uint32_t InstSize,
+                     ArrayRef<uint8_t> Replacement) {
+  // Prefer reusing an original numbered pair that is provably dead from the
+  // resume point. SGPR-saturated objects (e.g. mHC, RCCL) have no globally
+  // free aligned pair below MaxSgprs, but they do have a site-dead one. Such a
+  // pair is already counted, so it is not charged again to the kernel.
+  if (std::optional<unsigned> ReusedPair =
+          findSiteDeadOriginalPair(Ctx, InstOffset, InstSize, Replacement))
+    return SafeSgprScratchBlock{*ReusedPair, 2, /*IsSiteProven=*/true};
+
   std::optional<SafeSgprScratchBlock> Scratch = findSafeSgprScratchBlock(
       Ctx, InstOffset, /*Count=*/2, /*Alignment=*/2, "safe far return");
   if (!Scratch)
@@ -784,13 +800,14 @@ bool isSBranchReachable(uint64_t From, uint64_t To) {
       return false;
     }
     std::optional<SafeSgprScratchBlock> Scratch =
-        reserveSafeFarReturn(Ctx, InstOffset);
+        reserveSafeFarReturn(Ctx, InstOffset, InstSize, Replacement);
     if (!Scratch)
       return false;
     T.Bytes.insert(T.Bytes.end(), SetPcReturnReserveBytes, uint8_t{0});
     T.Long = true;
     T.UsesSetPCBack = true;
     T.LongBranchSgprBase = Scratch->Base;
+    T.LongBranchScratchIsSiteProven = Scratch->IsSiteProven;
     Ctx.OutTrampolines.emplace_back(std::move(T));
     Ctx.QueuedTrampolineBytes = *QueuedBytes;
     return true;
@@ -839,6 +856,475 @@ evaluateDirectControlFlowTarget(const InternalDecodedInst &DI,
   return checkedSubUint64(*PcBase,
                           static_cast<uint64_t>(-DwordDelta) * MinInstSize,
                           "direct control-flow target");
+}
+
+// ---------------------------------------------------------------------------
+// Site-dead numbered-SGPR analysis (far-return pair reuse).
+//
+// SGPR-saturated objects have no globally-free aligned pair below MaxSgprs, but
+// a numbered pair is often provably dead from a far-return's resume point. The
+// facts below identify such pairs so reserveSafeFarReturn can reuse one instead
+// of failing closed. Facts are computed from the immutable decoded stream once,
+// before any patch relabels instructions.
+// ---------------------------------------------------------------------------
+
+using NumberedSgprMask = std::array<uint64_t, 2>;
+
+static NumberedSgprMask allNumberedSgprs(unsigned Limit) {
+  NumberedSgprMask Result{};
+  for (unsigned I = 0; I < Limit; ++I)
+    Result[I / 64] |= uint64_t{1} << (I % 64);
+  return Result;
+}
+
+static void addOverlappingNumberedSgprs(NumberedSgprMask &Mask, MCRegister Reg,
+                                        ArrayRef<MCRegister> NumberedSgprs,
+                                        const MCRegisterInfo &MRI) {
+  if (!Reg.isValid())
+    return;
+  for (unsigned I = 0; I != NumberedSgprs.size(); ++I)
+    if (MRI.regsOverlap(Reg.id(), NumberedSgprs[I].id()))
+      Mask[I / 64] |= uint64_t{1} << (I % 64);
+}
+
+static bool masksEqual(const NumberedSgprMask &A, const NumberedSgprMask &B) {
+  return A[0] == B[0] && A[1] == B[1];
+}
+
+// Decode \p Bytes and return every numbered SGPR touched by an explicit or
+// implicit operand. Returns nullopt after logging if it cannot be decoded.
+static std::optional<BitVector>
+collectTouchedNumberedSgprs(ArrayRef<uint8_t> Bytes, unsigned NumberedSgprLimit,
+                            const LLVMState &LS) {
+  if (!LS.MCII || !LS.MRI || NumberedSgprLimit == 0) {
+    log() << "hotswap: error: cannot collect replacement SGPR usage with "
+             "invalid LLVM state or register limit\n";
+    return std::nullopt;
+  }
+
+  SmallVector<MCRegister> NumberedSgprs(NumberedSgprLimit);
+  for (unsigned Reg = 1, End = LS.MRI->getNumRegs(); Reg < End; ++Reg) {
+    std::optional<unsigned> Index = numberedSgprIndex(*LS.MRI, MCRegister(Reg));
+    if (Index && *Index < NumberedSgprLimit)
+      NumberedSgprs[*Index] = MCRegister(Reg);
+  }
+  if (!llvm::all_of(NumberedSgprs,
+                    [](MCRegister Reg) { return Reg.isValid(); })) {
+    log() << "hotswap: error: cannot map every numbered SGPR while checking "
+             "replacement usage\n";
+    return std::nullopt;
+  }
+
+  std::vector<InternalDecodedInst> Decoded;
+  if (!decodeTextSection(Bytes.data(), Bytes.size(), LS, Decoded)) {
+    log() << "hotswap: error: cannot decode replacement while checking SGPR "
+             "usage\n";
+    return std::nullopt;
+  }
+
+  BitVector Touched(NumberedSgprLimit);
+  for (const InternalDecodedInst &DI : Decoded) {
+    if (DI.Mnemonic == "<unknown>") {
+      log() << "hotswap: error: unknown replacement instruction prevents "
+               "SGPR usage proof\n";
+      return std::nullopt;
+    }
+    const MCInstrDesc &Desc = LS.MCII->get(DI.Inst.getOpcode());
+    SmallVector<MCRegister, 16> Regs;
+    for (const MCOperand &Op : DI.Inst)
+      if (Op.isReg() && Op.getReg())
+        Regs.push_back(MCRegister(Op.getReg()));
+    for (MCPhysReg Reg : Desc.implicit_uses())
+      Regs.push_back(MCRegister(Reg));
+    for (MCPhysReg Reg : Desc.implicit_defs())
+      Regs.push_back(MCRegister(Reg));
+
+    for (MCRegister Reg : Regs)
+      for (unsigned I = 0; I < NumberedSgprLimit; ++I)
+        if (Reg.isValid() &&
+            LS.MRI->regsOverlap(Reg.id(), NumberedSgprs[I].id()))
+          Touched.set(I);
+  }
+  return Touched;
+}
+
+// Stage-1a: recognizing materialized get-PC/add/set-PC transfers as CFG edges
+// is deferred. Returning nullopt makes the site-dead analysis treat such a
+// transfer as opaque control flow (fail-closed at that point), which is
+// conservative and correct. module_mhc contains no such sequences; objects
+// that do (the RCCL reductions) are covered by the follow-up that ports the
+// full evaluator.
+static std::optional<uint64_t>
+evaluateMaterializedSetPcTarget(ArrayRef<InternalDecodedInst> /*Function*/,
+                                size_t /*Index*/,
+                                const DenseSet<uint64_t> & /*DirectTargets*/,
+                                ArrayRef<uint8_t> /*Text*/,
+                                const LLVMState & /*LS*/) {
+  return std::nullopt;
+}
+
+static std::optional<SiteDeadSgprFunctionFacts>
+computeSiteDeadSgprFunctionFacts(PatchContext &Ctx,
+                                 const ElfView::FunctionTextRange &Range) {
+  if (!Ctx.LS.MCII || !Ctx.LS.MRI || !Ctx.LS.MIA || Ctx.Config.MaxSgprs == 0 ||
+      Ctx.Config.MaxSgprs > 128)
+    return std::nullopt;
+
+  std::vector<InternalDecodedInst>::const_iterator First =
+      llvm::lower_bound(Ctx.Decoded, Range.Begin,
+                        [](const InternalDecodedInst &DI, uint64_t Offset) {
+                          return DI.Offset < Offset;
+                        });
+  std::vector<InternalDecodedInst>::const_iterator After =
+      llvm::lower_bound(Ctx.Decoded, Range.End,
+                        [](const InternalDecodedInst &DI, uint64_t Offset) {
+                          return DI.Offset < Offset;
+                        });
+  if (First == After)
+    return std::nullopt;
+  ArrayRef<InternalDecodedInst> Function(&*First,
+                                         static_cast<size_t>(After - First));
+  const unsigned Count = Function.size();
+
+  SmallVector<MCRegister, 128> NumberedSgprs(Ctx.Config.MaxSgprs);
+  for (unsigned Reg = 1, End = Ctx.LS.MRI->getNumRegs(); Reg < End; ++Reg) {
+    std::optional<unsigned> Index =
+        numberedSgprIndex(*Ctx.LS.MRI, MCRegister(Reg));
+    if (Index && *Index < NumberedSgprs.size())
+      NumberedSgprs[*Index] = MCRegister(Reg);
+  }
+  if (!llvm::all_of(NumberedSgprs,
+                    [](MCRegister Reg) { return Reg.isValid(); }))
+    return std::nullopt;
+
+  DenseMap<uint64_t, unsigned> OffsetToIndex;
+  for (unsigned I = 0; I != Count; ++I)
+    OffsetToIndex.try_emplace(Function[I].Offset, I);
+
+  DenseSet<uint64_t> DirectTargets;
+  DenseSet<uint64_t> NoTargets;
+  BitVector ForbiddenResume(Count);
+  for (unsigned I = 3; I < Count; ++I)
+    if (std::optional<uint64_t> Target = evaluateMaterializedSetPcTarget(
+            Function, I, NoTargets, ArrayRef<uint8_t>(Ctx.Text, Ctx.TextSize),
+            Ctx.LS)) {
+      DirectTargets.insert(*Target);
+      ForbiddenResume.set(I - 2, I + 1);
+    }
+  for (const InternalDecodedInst &DI : Function) {
+    if ((!Ctx.LS.MIA->isBranch(DI.Inst) && !Ctx.LS.MIA->isCall(DI.Inst)) ||
+        Ctx.LS.MIA->isIndirectBranch(DI.Inst) || Ctx.LS.MIA->isReturn(DI.Inst))
+      continue;
+    bool HasImmediate = false;
+    for (const MCOperand &Operand : DI.Inst)
+      HasImmediate |= Operand.isImm();
+    if (!HasImmediate)
+      continue;
+    if (std::optional<uint64_t> Target =
+            evaluateDirectControlFlowTarget(DI, Ctx.LS))
+      DirectTargets.insert(*Target);
+  }
+
+  DenseMap<unsigned, unsigned> MaterializedSuccessor;
+  for (unsigned I = 3; I < Count; ++I) {
+    std::optional<uint64_t> Target = evaluateMaterializedSetPcTarget(
+        Function, I, DirectTargets, ArrayRef<uint8_t>(Ctx.Text, Ctx.TextSize),
+        Ctx.LS);
+    if (!Target)
+      continue;
+    DenseMap<uint64_t, unsigned>::const_iterator TargetIt =
+        OffsetToIndex.find(*Target);
+    if (TargetIt == OffsetToIndex.end())
+      continue;
+    MaterializedSuccessor.try_emplace(I, TargetIt->second);
+  }
+
+  std::vector<SmallVector<unsigned, 2>> Successors(Count);
+  std::vector<SmallVector<unsigned, 2>> Predecessors(Count);
+  for (unsigned I = 0; I != Count; ++I) {
+    const InternalDecodedInst &DI = Function[I];
+    DenseMap<unsigned, unsigned>::const_iterator Materialized =
+        MaterializedSuccessor.find(I);
+    if (Materialized != MaterializedSuccessor.end()) {
+      Successors[I].push_back(Materialized->second);
+    } else if (DI.Mnemonic == "<unknown>" || Ctx.LS.MIA->isCall(DI.Inst) ||
+               DI.Mnemonic == "s_endpgm" || Ctx.LS.MIA->isReturn(DI.Inst)) {
+      // Calls and exits are fail-closed lifetime boundaries.
+    } else if (Ctx.LS.MIA->isBranch(DI.Inst)) {
+      uint64_t Target = 0;
+      if (!Ctx.LS.MIA->isIndirectBranch(DI.Inst) &&
+          Ctx.LS.MIA->evaluateBranch(DI.Inst, DI.Offset, DI.Size, Target)) {
+        DenseMap<uint64_t, unsigned>::const_iterator TargetIt =
+            OffsetToIndex.find(Target);
+        if (TargetIt != OffsetToIndex.end()) {
+          Successors[I].push_back(TargetIt->second);
+          if (Ctx.LS.MIA->isConditionalBranch(DI.Inst) && I + 1 < Count)
+            Successors[I].push_back(I + 1);
+          else if (!Ctx.LS.MIA->isUnconditionalBranch(DI.Inst))
+            Successors[I].clear();
+        }
+      }
+    } else {
+      const MCInstrDesc &Desc = Ctx.LS.MCII->get(DI.Inst.getOpcode());
+      if (!Desc.isTerminator() &&
+          !Ctx.LS.MIA->mayAffectControlFlow(DI.Inst, *Ctx.LS.MRI) &&
+          I + 1 < Count)
+        Successors[I].push_back(I + 1);
+    }
+    for (unsigned Succ : Successors[I])
+      Predecessors[Succ].push_back(I);
+  }
+
+  NumberedSgprMask All = allNumberedSgprs(Ctx.Config.MaxSgprs);
+  std::vector<NumberedSgprMask> Defs(Count);
+  std::vector<NumberedSgprMask> Uses(Count);
+  for (unsigned I = 0; I != Count; ++I) {
+    const InternalDecodedInst &DI = Function[I];
+    if (DI.Mnemonic == "<unknown>") {
+      Uses[I] = All;
+      continue;
+    }
+    const MCInstrDesc &Desc = Ctx.LS.MCII->get(DI.Inst.getOpcode());
+    unsigned NumDefs =
+        std::min<unsigned>(Desc.getNumDefs(), DI.Inst.getNumOperands());
+    for (unsigned OpIdx = 0; OpIdx < DI.Inst.getNumOperands(); ++OpIdx) {
+      const MCOperand &Op = DI.Inst.getOperand(OpIdx);
+      if (!Op.isReg() || !Op.getReg())
+        continue;
+      addOverlappingNumberedSgprs(OpIdx < NumDefs ? Defs[I] : Uses[I],
+                                  MCRegister(Op.getReg()), NumberedSgprs,
+                                  *Ctx.LS.MRI);
+    }
+
+    bool Malformed = false;
+    for (unsigned OpIdx = NumDefs; OpIdx < Desc.getNumOperands(); ++OpIdx) {
+      int TiedTo = Desc.getOperandConstraint(OpIdx, MCOI::TIED_TO);
+      if (TiedTo < 0)
+        continue;
+      if (static_cast<unsigned>(TiedTo) >= NumDefs ||
+          static_cast<unsigned>(TiedTo) >= DI.Inst.getNumOperands()) {
+        Malformed = true;
+        break;
+      }
+      const MCOperand &Def = DI.Inst.getOperand(TiedTo);
+      if (!Def.isReg() || !Def.getReg()) {
+        Malformed = true;
+        break;
+      }
+      addOverlappingNumberedSgprs(Uses[I], MCRegister(Def.getReg()),
+                                  NumberedSgprs, *Ctx.LS.MRI);
+    }
+    for (unsigned OpIdx = DI.Inst.getNumOperands();
+         !Malformed && OpIdx < Desc.getNumOperands(); ++OpIdx) {
+      const MCOperandInfo &Missing = Desc.operands()[OpIdx];
+      if (Missing.RegClass < 0)
+        continue;
+      bool MatchedDefinition = false;
+      for (unsigned DefIdx = 0; DefIdx < NumDefs; ++DefIdx) {
+        if (Desc.operands()[DefIdx].RegClass != Missing.RegClass)
+          continue;
+        const MCOperand &Def = DI.Inst.getOperand(DefIdx);
+        if (!Def.isReg() || !Def.getReg()) {
+          Malformed = true;
+          break;
+        }
+        addOverlappingNumberedSgprs(Uses[I], MCRegister(Def.getReg()),
+                                    NumberedSgprs, *Ctx.LS.MRI);
+        MatchedDefinition = true;
+      }
+      if (!MatchedDefinition)
+        Malformed = true;
+    }
+    if (Malformed) {
+      Uses[I] = All;
+      continue;
+    }
+    for (MCPhysReg Reg : Desc.implicit_uses())
+      addOverlappingNumberedSgprs(Uses[I], MCRegister(Reg), NumberedSgprs,
+                                  *Ctx.LS.MRI);
+    for (MCPhysReg Reg : Desc.implicit_defs())
+      addOverlappingNumberedSgprs(Defs[I], MCRegister(Reg), NumberedSgprs,
+                                  *Ctx.LS.MRI);
+  }
+
+  std::vector<NumberedSgprMask> SafeBefore(Count, All);
+  SmallVector<unsigned, 128> Worklist;
+  BitVector Queued(Count, true);
+  for (unsigned I = 0; I != Count; ++I)
+    Worklist.push_back(I);
+  while (!Worklist.empty()) {
+    unsigned I = Worklist.pop_back_val();
+    Queued.reset(I);
+    NumberedSgprMask SafeOut{};
+    if (!Successors[I].empty()) {
+      SafeOut = All;
+      for (unsigned Succ : Successors[I]) {
+        SafeOut[0] &= SafeBefore[Succ][0];
+        SafeOut[1] &= SafeBefore[Succ][1];
+      }
+    }
+    NumberedSgprMask New{(SafeOut[0] | Defs[I][0]) & ~Uses[I][0],
+                         (SafeOut[1] | Defs[I][1]) & ~Uses[I][1]};
+    New[0] &= All[0];
+    New[1] &= All[1];
+    if (masksEqual(New, SafeBefore[I]))
+      continue;
+    SafeBefore[I] = New;
+    for (unsigned Pred : Predecessors[I])
+      if (!Queued.test(Pred)) {
+        Queued.set(Pred);
+        Worklist.push_back(Pred);
+      }
+  }
+
+  SiteDeadSgprFunctionFacts Facts;
+  Facts.Begin = Range.Begin;
+  Facts.End = Range.End;
+  Facts.GlobalFirst = First - Ctx.Decoded.cbegin();
+  unsigned HighWatermark = 0;
+  for (const InternalDecodedInst &DI : Function) {
+    for (const MCOperand &Op : DI.Inst) {
+      if (!Op.isReg() || !Op.getReg())
+        continue;
+      if (!updateNumberedSgprHighWatermark(*Ctx.LS.MRI, MCRegister(Op.getReg()),
+                                           Ctx.Config.MaxSgprs, HighWatermark,
+                                           "site-dead SGPR analysis"))
+        return std::nullopt;
+    }
+    const MCInstrDesc &Desc = Ctx.LS.MCII->get(DI.Inst.getOpcode());
+    for (MCPhysReg Reg : Desc.implicit_uses())
+      if (!updateNumberedSgprHighWatermark(*Ctx.LS.MRI, MCRegister(Reg),
+                                           Ctx.Config.MaxSgprs, HighWatermark,
+                                           "site-dead SGPR analysis"))
+        return std::nullopt;
+    for (MCPhysReg Reg : Desc.implicit_defs())
+      if (!updateNumberedSgprHighWatermark(*Ctx.LS.MRI, MCRegister(Reg),
+                                           Ctx.Config.MaxSgprs, HighWatermark,
+                                           "site-dead SGPR analysis"))
+        return std::nullopt;
+  }
+  Facts.NumberedLimit = HighWatermark;
+  std::string Owner =
+      Ctx.Elf.findKernelAtAddress(Range.Begin + Ctx.Elf.textAddr());
+  if (!Owner.empty()) {
+    std::optional<unsigned> Declared = Ctx.Elf.getKernelSgprCount(Owner);
+    if (!Declared || *Declared < 2)
+      return std::nullopt;
+    // The descriptor count may include VCC. Subtracting it unconditionally
+    // gives a conservative numbered-register limit.
+    Facts.NumberedLimit = std::max(
+        Facts.NumberedLimit, std::min(*Declared - 2, Ctx.Config.MaxSgprs));
+  }
+  Facts.SafeBefore = std::move(SafeBefore);
+  Facts.ForbiddenResume = std::move(ForbiddenResume);
+  return Facts;
+}
+
+// Build immutable site-dead facts for every sized function before any patch
+// relabels the decoded stream.
+static void precomputeSiteDeadSgprFacts(PatchContext &Ctx) {
+  const uint64_t TextAddr = Ctx.Elf.textAddr();
+  for (const ElfView::FunctionTextRange &Absolute :
+       Ctx.Elf.functionTextRanges()) {
+    if (Absolute.Begin < TextAddr || Absolute.End <= Absolute.Begin)
+      continue;
+    uint64_t Begin = Absolute.Begin - TextAddr;
+    uint64_t End = std::min(Absolute.End - TextAddr, Ctx.TextSize);
+    if (Begin >= End)
+      continue;
+    std::pair<uint64_t, uint64_t> Key{Begin, End};
+    if (Ctx.SiteDeadSgprFacts.find(Key) != Ctx.SiteDeadSgprFacts.end())
+      continue;
+    ElfView::FunctionTextRange Relative{Begin, End, Absolute.Symbol,
+                                        Absolute.Symtab};
+    std::optional<SiteDeadSgprFunctionFacts> Facts =
+        computeSiteDeadSgprFunctionFacts(Ctx, Relative);
+    if (Facts)
+      Ctx.SiteDeadSgprFacts.try_emplace(Key, std::move(*Facts));
+  }
+}
+
+// Return the numbered SGPRs dead at the resume point after [InstOffset, +Size),
+// or nullopt when no facts cover the site.
+static std::optional<BitVector>
+getSiteDeadNumberedSgprs(PatchContext &Ctx, uint64_t InstOffset,
+                         uint32_t InstSize) {
+  std::optional<ElfView::FunctionTextRange> Range =
+      Ctx.Elf.findFunctionTextRangeAtOffset(InstOffset);
+  if (!Range)
+    return std::nullopt;
+  std::pair<uint64_t, uint64_t> Key{Range->Begin, Range->End};
+  auto It = Ctx.SiteDeadSgprFacts.find(Key);
+  if (It == Ctx.SiteDeadSgprFacts.end())
+    return std::nullopt;
+
+  std::optional<uint64_t> ResumeOffset =
+      checkedAddUint64(InstOffset, InstSize, "site-dead SGPR resume offset");
+  if (!ResumeOffset)
+    return std::nullopt;
+  const SiteDeadSgprFunctionFacts &Facts = It->second;
+  std::vector<InternalDecodedInst>::const_iterator FirstIt =
+      Ctx.Decoded.cbegin() + Facts.GlobalFirst;
+  std::vector<InternalDecodedInst>::const_iterator AfterIt =
+      FirstIt + Facts.SafeBefore.size();
+  std::vector<InternalDecodedInst>::const_iterator Resume =
+      std::lower_bound(FirstIt, AfterIt, *ResumeOffset,
+                       [](const InternalDecodedInst &DI, uint64_t Offset) {
+                         return DI.Offset < Offset;
+                       });
+  if (Resume == AfterIt || Resume->Offset != *ResumeOffset)
+    return std::nullopt;
+  size_t ResumeIndex = Resume - FirstIt;
+  BitVector Result(Ctx.Config.MaxSgprs);
+  if (Facts.ForbiddenResume.test(ResumeIndex))
+    return Result;
+  const NumberedSgprMask &Mask = Facts.SafeBefore[ResumeIndex];
+  for (unsigned I = 0; I != Ctx.Config.MaxSgprs; ++I)
+    if (Mask[I / 64] & (uint64_t{1} << (I % 64)))
+      Result.set(I);
+  return Result;
+}
+
+// Choose the highest numbered aligned pair that is dead at the site and not
+// touched by the replacement. Returns the pair base, or nullopt when none.
+static std::optional<unsigned>
+findSiteDeadOriginalPair(PatchContext &Ctx, uint64_t InstOffset,
+                         uint32_t InstSize, ArrayRef<uint8_t> Replacement) {
+  std::optional<BitVector> ReplacementTouched =
+      collectTouchedNumberedSgprs(Replacement, Ctx.Config.MaxSgprs, Ctx.LS);
+  if (!ReplacementTouched)
+    return std::nullopt;
+  std::optional<BitVector> SiteDead =
+      getSiteDeadNumberedSgprs(Ctx, InstOffset, InstSize);
+  if (!SiteDead)
+    return std::nullopt;
+  std::optional<ElfView::FunctionTextRange> FunctionRange =
+      Ctx.Elf.findFunctionTextRangeAtOffset(InstOffset);
+  if (!FunctionRange)
+    return std::nullopt;
+  auto Facts = Ctx.SiteDeadSgprFacts.find(
+      std::pair{FunctionRange->Begin, FunctionRange->End});
+  if (Facts == Ctx.SiteDeadSgprFacts.end())
+    return std::nullopt;
+  unsigned NumberedLimit = Facts->second.NumberedLimit;
+  if (NumberedLimit < 2)
+    return std::nullopt;
+
+  unsigned Pair = (NumberedLimit - 2) & ~1u;
+  for (;;) {
+    if (!ReplacementTouched->test(Pair) &&
+        !ReplacementTouched->test(Pair + 1) && SiteDead->test(Pair) &&
+        SiteDead->test(Pair + 1)) {
+      log() << "hotswap: safe far return: reusing original site-dead s[" << Pair
+            << ':' << Pair + 1 << "] after 0x" << utohexstr(InstOffset)
+            << " (defined before every exit)\n";
+      return Pair;
+    }
+    if (Pair < 2)
+      break;
+    Pair -= 2;
+  }
+  return std::nullopt;
 }
 
 /// Collect statically known direct branch and call destinations so an interior
@@ -1637,6 +2123,12 @@ static std::optional<uint32_t> applyGfx1250B0toA0Rules(
                    TextSize,       *PoolBaseOffset, LS,
                    OutTrampolines, Sleds,           Elf,
                    Liveness,       KernelStats,     OutScratchPatches};
+
+  // Build immutable site-dead numbered-SGPR facts before any patch relabels
+  // the decoded stream, so far-return allocation can reuse an original pair
+  // proven dead at the site. Only needed when the B0-to-A0 passes run.
+  if (Config.RunB0A0Patches)
+    precomputeSiteDeadSgprFacts(Ctx);
 
   const HotswapPatchVTable &VT = getHotswapPatchVTable();
 
