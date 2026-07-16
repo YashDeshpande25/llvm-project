@@ -370,39 +370,40 @@ std::optional<SmallVector<uint8_t>> encodeSetPCLongBranch(const LLVMState &LS,
   if ((SgprBase & 1u) != 0 ||
       SgprBase > std::numeric_limits<unsigned>::max() - 2) {
     log() << "hotswap: error: set-PC long branch requires an aligned "
-             "three-SGPR block, got s"
+             "SGPR pair, got s"
           << SgprBase << "\n";
     return std::nullopt;
   }
 
-  const std::string Lo = "s" + std::to_string(SgprBase);
-  const std::string Hi = "s" + std::to_string(SgprBase + 1);
   const std::string Pair = "s[" + std::to_string(SgprBase) + ":" +
                            std::to_string(SgprBase + 1) + "]";
-  const std::string SccSave = "s" + std::to_string(SgprBase + 2);
 
   // Per the AMDGPU ISA, s_get_pc_i64 captures the address immediately after
-  // itself. EncodeSetPCLongBranch.ForwardLandsOnTarget pins this PC base.
-  std::optional<uint64_t> PcBase = checkedAddUint64(
-      FromOffset, 2 * MinInstSize, "set-PC long branch PC base");
+  // itself, so the PC base is FromOffset + sizeof(s_get_pc_i64). The full
+  // 64-bit displacement is applied with a single s_add_nc_u64, which does not
+  // write SCC: no SCC save/restore is required, so an aligned pair suffices
+  // with no third scratch SGPR, and no s_add_pc_i64 is emitted.
+  // EncodeSetPCLongBranch.ForwardLandsOnTarget pins this PC base.
+  SmallVector<uint8_t> GetPc = assembleSingleInst("s_get_pc_i64 " + Pair, LS);
+  if (GetPc.empty()) {
+    log() << "hotswap: error: failed to assemble set-PC long branch via "
+          << Pair << "\n";
+    return std::nullopt;
+  }
+  std::optional<uint64_t> PcBase =
+      checkedAddUint64(FromOffset, GetPc.size(), "set-PC long branch PC base");
   if (!PcBase)
     return std::nullopt;
   uint64_t Delta = TargetOffset - *PcBase;
-  uint32_t LoDelta = static_cast<uint32_t>(Delta);
-  uint32_t HiDelta = static_cast<uint32_t>(Delta >> 32);
 
-  SmallVector<std::string, 6> AsmLines;
-  AsmLines.push_back("s_cselect_b32 " + SccSave + ", 1, 0");
+  SmallVector<std::string, 3> AsmLines;
   AsmLines.push_back("s_get_pc_i64 " + Pair);
-  AsmLines.push_back("s_add_u32 " + Lo + ", " + Lo + ", 0x" +
-                     utohexstr(LoDelta));
-  AsmLines.push_back("s_addc_u32 " + Hi + ", " + Hi + ", 0x" +
-                     utohexstr(HiDelta));
-  AsmLines.push_back("s_cmp_lg_u32 " + SccSave + ", 0");
+  AsmLines.push_back("s_add_nc_u64 " + Pair + ", " + Pair + ", 0x" +
+                     utohexstr(Delta));
   AsmLines.push_back("s_set_pc_i64 " + Pair);
   SmallVector<uint8_t> Bytes = assembleSingleInst(joinAsmLines(AsmLines), LS);
   if (Bytes.empty()) {
-    log() << "hotswap: error: failed to assemble set-PC long branch via "
+    log() << "hotswap: error: failed to assemble SCC-neutral set-PC branch via "
           << Pair << "\n";
     return std::nullopt;
   }
@@ -697,7 +698,7 @@ bool commitSafeSgprScratchBlock(PatchContext &Ctx, uint64_t TextOffset,
 static std::optional<SafeSgprScratchBlock>
 reserveSafeFarReturn(PatchContext &Ctx, uint64_t InstOffset) {
   std::optional<SafeSgprScratchBlock> Scratch = findSafeSgprScratchBlock(
-      Ctx, InstOffset, /*Count=*/3, /*Alignment=*/2, "safe far return");
+      Ctx, InstOffset, /*Count=*/2, /*Alignment=*/2, "safe far return");
   if (!Scratch)
     return std::nullopt;
   if (!commitSafeSgprScratchBlock(Ctx, InstOffset, *Scratch, "safe far return"))

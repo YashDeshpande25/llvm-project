@@ -194,7 +194,16 @@ TEST(EncodeSBranch, FailsOnInvalidState) {
 
 // -- encodeSetPCLongBranch ---------------------------------------------------
 
-TEST(EncodeSetPCLongBranch, UsesSccPreservingSequenceWithoutAddPc) {
+static uint64_t
+decodeSetPCLongBranchTarget(uint64_t From,
+                            llvm::ArrayRef<InternalDecodedInst> Decoded) {
+  const uint64_t PcBase = From + Decoded[0].Size;
+  const uint64_t Delta =
+      static_cast<uint64_t>(Decoded[1].Inst.getOperand(2).getImm());
+  return PcBase + Delta;
+}
+
+TEST(EncodeSetPCLongBranch, UsesSccNeutralSequenceWithoutAddPc) {
   LLVMState S = initLLVM(makeGfx1250Ident());
   ASSERT_TRUE(S.Valid);
 
@@ -206,21 +215,43 @@ TEST(EncodeSetPCLongBranch, UsesSccPreservingSequenceWithoutAddPc) {
 
   std::vector<InternalDecodedInst> Dec;
   ASSERT_TRUE(decodeTextSection(Out->data(), Out->size(), S, Dec));
-  ASSERT_EQ(Dec.size(), 6u);
-  EXPECT_EQ(Dec[0].Mnemonic, "s_cselect_b32");
-  EXPECT_EQ(Dec[1].Mnemonic, "s_get_pc_i64");
-  EXPECT_EQ(Dec[2].Mnemonic, "s_add_co_u32");
-  EXPECT_EQ(Dec[3].Mnemonic, "s_add_co_ci_u32");
-  EXPECT_EQ(Dec[4].Mnemonic, "s_cmp_lg_u32");
-  EXPECT_EQ(Dec[5].Mnemonic, "s_set_pc_i64");
+  ASSERT_EQ(Dec.size(), 3u);
+  EXPECT_EQ(Dec[0].Mnemonic, "s_get_pc_i64");
+  EXPECT_EQ(Dec[1].Mnemonic, "s_add_nc_u64");
+  EXPECT_EQ(Dec[2].Mnemonic, "s_set_pc_i64");
   for (const InternalDecodedInst &DI : Dec)
     EXPECT_NE(DI.Mnemonic, "s_add_pc_i64");
 
-  // s_get_pc_i64 is the second dword and captures From + 8. The two add
-  // immediates materialize this exact two's-complement displacement.
-  uint64_t Delta = To - (From + 2 * MinInstSize);
-  EXPECT_EQ(static_cast<uint32_t>(Delta), 0xFFF7FFFCu);
-  EXPECT_EQ(static_cast<uint32_t>(Delta >> 32), 0xFFFFFFFFu);
+  // s_get_pc_i64 captures the PC immediately after its own dword. The single
+  // s_add_nc_u64 materializes the full two's-complement displacement.
+  const uint64_t Delta = To - (From + MinInstSize);
+  EXPECT_EQ(static_cast<uint64_t>(Dec[1].Inst.getOperand(2).getImm()), Delta);
+}
+
+TEST(EncodeSetPCLongBranch, BackwardLandsOnTargetWithoutDefiningScc) {
+  LLVMState S = initLLVM(makeGfx1250Ident());
+  ASSERT_TRUE(S.Valid);
+
+  constexpr uint64_t From = 0x81000;
+  constexpr uint64_t To = 0x1008;
+  std::optional<llvm::SmallVector<uint8_t>> Out =
+      encodeSetPCLongBranch(S, From, To, /*SgprBase=*/12);
+  ASSERT_TRUE(Out);
+
+  std::vector<InternalDecodedInst> Decoded;
+  ASSERT_TRUE(decodeTextSection(Out->data(), Out->size(), S, Decoded));
+  ASSERT_EQ(Decoded.size(), 3u);
+  EXPECT_EQ(Decoded[0].Mnemonic, "s_get_pc_i64");
+  EXPECT_EQ(Decoded[1].Mnemonic, "s_add_nc_u64");
+  EXPECT_EQ(Decoded[2].Mnemonic, "s_set_pc_i64");
+  EXPECT_EQ(decodeSetPCLongBranchTarget(From, Decoded), To);
+
+  // The SCC-neutral sequence never materializes an SCC save/restore.
+  for (const InternalDecodedInst &DI : Decoded) {
+    EXPECT_NE(DI.Mnemonic, "s_cselect_b32");
+    EXPECT_NE(DI.Mnemonic, "s_cmp_lg_u32");
+    EXPECT_NE(DI.Mnemonic, "s_add_pc_i64");
+  }
 }
 
 TEST(EncodeSetPCLongBranch, ForwardLandsOnTarget) {
@@ -235,27 +266,17 @@ TEST(EncodeSetPCLongBranch, ForwardLandsOnTarget) {
 
   std::vector<InternalDecodedInst> Decoded;
   ASSERT_TRUE(decodeTextSection(Out->data(), Out->size(), S, Decoded));
-  ASSERT_EQ(Decoded.size(), 6u);
-  ASSERT_TRUE(Decoded[2].Inst.getOperand(2).isImm());
-  ASSERT_TRUE(Decoded[3].Inst.getOperand(2).isImm());
-  uint64_t Lo = static_cast<uint32_t>(Decoded[2].Inst.getOperand(2).getImm());
-  uint64_t Hi = static_cast<uint32_t>(Decoded[3].Inst.getOperand(2).getImm());
-  uint64_t Delta = Lo | (Hi << 32);
-  EXPECT_EQ(From + 2 * MinInstSize + Delta, To);
+  ASSERT_EQ(Decoded.size(), 3u);
+  EXPECT_EQ(decodeSetPCLongBranchTarget(From, Decoded), To);
 }
 
-TEST(EncodeSetPCLongBranch, RejectsPcBaseOverflow) {
+TEST(EncodeSetPCLongBranch, RejectsUnalignedPairAndPcOverflow) {
   LLVMState S = initLLVM(makeGfx1250Ident());
   ASSERT_TRUE(S.Valid);
+
+  EXPECT_FALSE(encodeSetPCLongBranch(S, 0x1000, 0x2000, /*SgprBase=*/13));
   EXPECT_FALSE(encodeSetPCLongBranch(
-      S, std::numeric_limits<uint64_t>::max() - MinInstSize, 0,
-      /*SgprBase=*/12));
-}
-
-TEST(EncodeSetPCLongBranch, RejectsMisalignedScratchPair) {
-  LLVMState S = initLLVM(makeGfx1250Ident());
-  ASSERT_TRUE(S.Valid);
-  EXPECT_FALSE(encodeSetPCLongBranch(S, 0, 0x1000, /*SgprBase=*/3));
+      S, std::numeric_limits<uint64_t>::max() - 1, 0, /*SgprBase=*/12));
 }
 
 TEST(IsSBranchReachable, CoversBoundariesAlignmentAndPcOverflow) {

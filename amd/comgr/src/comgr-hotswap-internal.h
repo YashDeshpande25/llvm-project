@@ -830,10 +830,10 @@ bool commitSafeSgprScratchBlock(PatchContext &Ctx, uint64_t TextOffset,
                                     uint32_t InstSize,
                                     llvm::ArrayRef<uint8_t> Replacement);
 
-/// Encode an SCC-preserving indirect long branch using three numbered SGPRs:
-/// an aligned PC pair at \p SgprBase and an SCC-save temporary at Base + 2.
-/// The displacement is materialized as two 32-bit literals; no
-/// s_add_pc_i64 or 64-bit literal is emitted.
+/// Encode an SCC-neutral indirect long branch using the aligned numbered SGPR
+/// pair at \p SgprBase. The displacement is applied with a single
+/// s_add_nc_u64, which does not write SCC, so no third scratch SGPR is needed;
+/// no s_add_pc_i64 is emitted.
 std::optional<llvm::SmallVector<uint8_t>>
 encodeSetPCLongBranch(const LLVMState &LS, uint64_t FromOffset,
                       uint64_t TargetOffset, unsigned SgprBase);
