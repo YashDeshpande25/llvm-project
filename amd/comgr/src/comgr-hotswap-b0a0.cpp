@@ -948,19 +948,109 @@ collectTouchedNumberedSgprs(ArrayRef<uint8_t> Bytes, unsigned NumberedSgprLimit,
   return Touched;
 }
 
-// Stage-1a: recognizing materialized get-PC/add/set-PC transfers as CFG edges
-// is deferred. Returning nullopt makes the site-dead analysis treat such a
-// transfer as opaque control flow (fail-closed at that point), which is
-// conservative and correct. module_mhc contains no such sequences; objects
-// that do (the RCCL reductions) are covered by the follow-up that ports the
-// full evaluator.
-static std::optional<uint64_t>
-evaluateMaterializedSetPcTarget(ArrayRef<InternalDecodedInst> /*Function*/,
-                                size_t /*Index*/,
-                                const DenseSet<uint64_t> & /*DirectTargets*/,
-                                ArrayRef<uint8_t> /*Text*/,
-                                const LLVMState & /*LS*/) {
-  return std::nullopt;
+// Read an add's immediate operand, decoding a trailing literal dword directly
+// from the .text bytes (AMDGPU represents it as a transient MCExpr whose
+// storage may not outlive getInstruction()).
+static std::optional<int64_t>
+getAbsoluteOperandValue(const MCOperand &Operand, const InternalDecodedInst &DI,
+                        ArrayRef<uint8_t> Text) {
+  if (Operand.isImm())
+    return Operand.getImm();
+  if (!Operand.isExpr() ||
+      (DI.Size != 2 * MinInstSize && DI.Size != 3 * MinInstSize))
+    return std::nullopt;
+
+  std::optional<uint64_t> End =
+      checkedAddUint64(DI.Offset, DI.Size, "literal instruction end");
+  if (!End || *End > Text.size())
+    return std::nullopt;
+  if (DI.Size == 2 * MinInstSize)
+    return static_cast<int64_t>(
+        support::endian::read32le(Text.data() + *End - MinInstSize));
+  return static_cast<int64_t>(
+      support::endian::read64le(Text.data() + *End - 2 * MinInstSize));
+}
+
+// Recognize a compiler-emitted get-PC / add-co / add-co-ci / set-PC sequence
+// ending at \p SetPcIndex and return its computed destination. Exact register,
+// adjacency, and target-boundary checks make the destination as trustworthy as
+// a direct branch target; malformed near-matches fail closed.
+static std::optional<uint64_t> evaluateMaterializedSetPcTarget(
+    ArrayRef<InternalDecodedInst> Function, unsigned SetPcIndex,
+    const DenseSet<uint64_t> &DirectTargets, ArrayRef<uint8_t> Text,
+    const LLVMState &LS, bool AllowOutsideText = false) {
+  if (SetPcIndex < 3 || !LS.MRI)
+    return std::nullopt;
+  const InternalDecodedInst &GetPc = Function[SetPcIndex - 3];
+  const InternalDecodedInst &AddLo = Function[SetPcIndex - 2];
+  const InternalDecodedInst &AddHi = Function[SetPcIndex - 1];
+  const InternalDecodedInst &SetPc = Function[SetPcIndex];
+  if (GetPc.Offset + GetPc.Size != AddLo.Offset ||
+      AddLo.Offset + AddLo.Size != AddHi.Offset ||
+      AddHi.Offset + AddHi.Size != SetPc.Offset ||
+      GetPc.Mnemonic != "s_get_pc_i64" || AddLo.Mnemonic != "s_add_co_u32" ||
+      AddHi.Mnemonic != "s_add_co_ci_u32" || SetPc.Mnemonic != "s_set_pc_i64" ||
+      GetPc.Inst.getNumOperands() != 1 || SetPc.Inst.getNumOperands() != 1 ||
+      !GetPc.Inst.getOperand(0).isReg() || !SetPc.Inst.getOperand(0).isReg() ||
+      GetPc.Inst.getOperand(0).getReg() != SetPc.Inst.getOperand(0).getReg() ||
+      AddLo.Inst.getNumOperands() != 3 || AddHi.Inst.getNumOperands() != 3 ||
+      !AddLo.Inst.getOperand(0).isReg() || !AddLo.Inst.getOperand(1).isReg() ||
+      !AddHi.Inst.getOperand(0).isReg() || !AddHi.Inst.getOperand(1).isReg() ||
+      AddLo.Inst.getOperand(0).getReg() != AddLo.Inst.getOperand(1).getReg() ||
+      AddHi.Inst.getOperand(0).getReg() != AddHi.Inst.getOperand(1).getReg())
+    return std::nullopt;
+
+  std::optional<int64_t> LoValue =
+      getAbsoluteOperandValue(AddLo.Inst.getOperand(2), AddLo, Text);
+  std::optional<int64_t> HiValue =
+      getAbsoluteOperandValue(AddHi.Inst.getOperand(2), AddHi, Text);
+  std::optional<uint64_t> SequenceEnd = checkedAddUint64(
+      SetPc.Offset, SetPc.Size, "materialized set-PC sequence end");
+  if (!LoValue || !HiValue || !SequenceEnd)
+    return std::nullopt;
+  for (uint64_t DirectTarget : DirectTargets)
+    if (DirectTarget > GetPc.Offset && DirectTarget < *SequenceEnd)
+      return std::nullopt;
+
+  MCRegister Pair(GetPc.Inst.getOperand(0).getReg());
+  std::optional<unsigned> Lo =
+      numberedSgprIndex(*LS.MRI, MCRegister(AddLo.Inst.getOperand(0).getReg()));
+  std::optional<unsigned> Hi =
+      numberedSgprIndex(*LS.MRI, MCRegister(AddHi.Inst.getOperand(0).getReg()));
+  if (!Lo || !Hi || *Hi != *Lo + 1 ||
+      !LS.MRI->regsOverlap(Pair.id(), AddLo.Inst.getOperand(0).getReg()) ||
+      !LS.MRI->regsOverlap(Pair.id(), AddHi.Inst.getOperand(0).getReg()))
+    return std::nullopt;
+
+  uint64_t Delta =
+      static_cast<uint32_t>(*LoValue) |
+      (static_cast<uint64_t>(static_cast<uint32_t>(*HiValue)) << 32);
+  std::optional<uint64_t> PcBase =
+      checkedAddUint64(GetPc.Offset, GetPc.Size, "materialized set-PC PC base");
+  if (!PcBase)
+    return std::nullopt;
+  uint64_t Target = *PcBase + Delta;
+
+  if (Target >= Text.size())
+    return AllowOutsideText ? std::optional<uint64_t>(Target) : std::nullopt;
+
+  // Only model a transfer to a decoded instruction boundary owned by this
+  // function. The unsigned addition above intentionally has ISA wraparound
+  // semantics; the range check rejects a wrapped target outside the function.
+  if (Function.empty() || Target < Function.front().Offset)
+    return std::nullopt;
+  std::optional<uint64_t> FunctionEnd =
+      checkedAddUint64(Function.back().Offset, Function.back().Size,
+                       "materialized set-PC function end");
+  if (!FunctionEnd || Target >= *FunctionEnd)
+    return std::nullopt;
+  ArrayRef<InternalDecodedInst>::iterator TargetIt = llvm::lower_bound(
+      Function, Target, [](const InternalDecodedInst &DI, uint64_t Offset) {
+        return DI.Offset < Offset;
+      });
+  if (TargetIt == Function.end() || TargetIt->Offset != Target)
+    return std::nullopt;
+  return Target;
 }
 
 static std::optional<SiteDeadSgprFunctionFacts>
